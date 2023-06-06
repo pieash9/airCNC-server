@@ -2,6 +2,11 @@ const express = require("express");
 const app = express();
 const cors = require("cors");
 require("dotenv").config();
+const morgan = require("morgan");
+const jwt = require("jsonwebtoken");
+const nodemailer = require("nodemailer");
+const stripe = require("stripe")(process.env.PAYMENT_SECRET_KEY);
+
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 5000;
 
@@ -13,6 +18,7 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
+app.use(morgan("dev"));
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.fiktc6e.mongodb.net/?retryWrites=true&w=majority`;
 
@@ -24,11 +30,80 @@ const client = new MongoClient(uri, {
   },
 });
 
+//? validate JWT
+const verifyJWT = (req, res, next) => {
+  const authorization = req.headers.authorization;
+  if (!authorization) {
+    return res
+      .status(401)
+      .send({ error: true, message: "Unauthorized access" });
+  }
+  const token = authorization.split(" ")[1];
+  //token verify
+  jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (error, decoded) => {
+    if (error) {
+      return res
+        .status(401)
+        .send({ error: true, message: "Unauthorized access" });
+    }
+    req.decoded = decoded;
+    next();
+  });
+};
+
+// send mail function
+const sendMail = (emailData, emailAddress) => {
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: {
+      user: process.env.EMAIL,
+      pass: process.env.PASS,
+    },
+  });
+  const mailOptions = {
+    from: process.env.EMAIL,
+    to: emailAddress,
+    subject: emailData.subject,
+    html: `<p>${emailData?.message}</p>`,
+  };
+  transporter.sendMail(mailOptions, function (error, info) {
+    if (error) {
+      console.log(error);
+    } else {
+      console.log("Email sent: " + info.response);
+      // do something useful
+    }
+  });
+};
+
 async function run() {
   try {
     const usersCollection = client.db("aircncDb").collection("users");
     const roomsCollection = client.db("aircncDb").collection("rooms");
     const bookingsCollection = client.db("aircncDb").collection("bookings");
+
+    //generate JWT token
+    app.post("/jwt", async (req, res) => {
+      const email = req.body;
+      const token = jwt.sign(email, process.env.ACCESS_TOKEN_SECRET, {
+        expiresIn: "1d",
+      });
+      res.send({ token });
+    });
+
+    //? generate client secret for payment
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const { price } = req.body;
+      if (price) {
+        const amount = parseFloat(price) * 100;
+        const paymentIntent = await stripe.paymentIntents.create({
+          amount: amount,
+          currency: "usd",
+          payment_method_types: ["card"],
+        });
+        res.send({ clientSecret: paymentIntent.client_secret });
+      }
+    });
 
     //save user email and role in db
     app.put("/users/:email", async (req, res) => {
@@ -40,7 +115,7 @@ async function run() {
         $set: user,
       };
       const result = await usersCollection.updateOne(query, updateDoc, options);
-      console.log(result);
+
       res.send(result);
     });
 
@@ -58,10 +133,16 @@ async function run() {
       res.send(result);
     });
 
-    // Get room by email
-    app.get("/rooms/:email", async (req, res) => {
+    // Get room by email for host
+    app.get("/rooms/:email", verifyJWT, async (req, res) => {
+      const decodedEmail = req.decoded.email;
       const email = req.params.email;
-      const query = { "host.email":email};
+      if (decodedEmail !== email) {
+        return res
+          .status(403)
+          .send({ error: true, message: "Forbidden access" });
+      }
+      const query = { "host.email": email };
       const result = await roomsCollection.find(query).toArray();
       res.send(result);
     });
@@ -82,56 +163,98 @@ async function run() {
     });
 
     // update room booking status
-    app.patch('/rooms/status/:id', async (req, res) => {
-      const id = req.params.id
-      const status = req.body.status
-      const query = { _id: new ObjectId(id) }
+    app.patch("/rooms/status/:id", async (req, res) => {
+      const id = req.params.id;
+      const status = req.body.status;
+      const query = { _id: new ObjectId(id) };
       const updateDoc = {
         $set: {
           booked: status,
         },
+      };
+      const update = await roomsCollection.updateOne(query, updateDoc);
+      res.send(update);
+    });
+
+     // Update A room
+     app.put('/rooms/:id', verifyJWT, async (req, res) => {
+      const room = req.body
+      console.log(room)
+
+      const filter = { _id: new ObjectId(req.params.id) }
+      const options = { upsert: true }
+      const updateDoc = {
+        $set: room,
       }
-      const update = await roomsCollection.updateOne(query, updateDoc)
-      res.send(update)
-    })
-
-  // delete room
-  app.delete('/rooms/:id', async (req, res) => {
-    const id = req.params.id
-    const query = { _id: new ObjectId(id) }
-    const result = await roomsCollection.deleteOne(query)
-    res.send(result)
-  })
-
-
-
-    //! Get bookings for guest
-    app.get('/bookings', async (req, res) => {
-      const email = req.query.email
-
-      if (!email) {
-        res.send([])
-      }
-      const query = { 'guest.email': email }
-      const result = await bookingsCollection.find(query).toArray()
+      const result = await roomsCollection.updateOne(filter, updateDoc, options)
       res.send(result)
     })
 
-    //save bookings in database
-    app.post("/bookings", async (req, res) => {
-      const booking = req.body;
-      const result = await bookingsCollection.insertOne(booking);
+    // delete room
+    app.delete("/rooms/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await roomsCollection.deleteOne(query);
       res.send(result);
     });
 
-     // delete a booking
-     app.delete('/bookings/:id', async (req, res) => {
-      const id = req.params.id
-      const query = { _id: new ObjectId(id) }
-      const result = await bookingsCollection.deleteOne(query)
-      res.send(result)
-    })
+    //! Get bookings for guest
+    app.get("/bookings", async (req, res) => {
+      const email = req.query.email;
 
+      if (!email) {
+        res.send([]);
+      }
+      const query = { "guest.email": email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // Get bookings for host
+    app.get("/bookings/host", async (req, res) => {
+      const email = req.query.email;
+
+      if (!email) {
+        res.send([]);
+      }
+      const query = { host: email };
+      const result = await bookingsCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    //? save bookings in database
+    //! send email
+    app.post("/bookings", async (req, res) => {
+      const booking = req.body;
+      const result = await bookingsCollection.insertOne(booking);
+
+      //send confirmation email to guest account
+      sendMail(
+        {
+          subject: "Booking Successful!",
+          message: `Booking Id: ${result?.insertedId}, TransactionId: ${booking.transactionId}`,
+        },
+        booking?.guest?.email
+      );
+      // Send confirmation email to host
+      sendMail(
+        {
+          subject: "Your room got booked!",
+          message: `Booking Id: ${result?.insertedId}, TransactionId: ${booking.transactionId}. Check dashboard for more info`,
+        },
+        booking?.host
+      );
+
+      res.send(result);
+    });
+
+    // delete a booking
+    app.delete("/bookings/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await bookingsCollection.deleteOne(query);
+      res.send(result);
+    });
 
     // Send a ping to confirm a successful connection
     await client.db("admin").command({ ping: 1 });
